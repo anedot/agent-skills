@@ -6,6 +6,9 @@
 #   anedot.sh ACCOUNTS [--json]          accounts: slug, displayName, id, status, org type, time zone
 #   anedot.sh STATS --account A --from YYYY-MM-DD --to YYYY-MM-DD    one-line totals in dollars
 #   anedot.sh RECENT --account A [N]     last N donations (default 5), one line each
+#   anedot.sh EVENTS --account SLUG|ID [--json]    events, local times, totals, and page URLs
+#   anedot.sh RSVPS --account SLUG|ID --event ID|SLUG|NAME [--fields email,phone]
+#     [--include-cancelled] [--csv] [--tz ZONE]    per-event registrations (default zone America/New_York)
 #   anedot.sh ALL PATH                   every page of a list endpoint as one JSON array
 #   anedot.sh METHOD PATH [json-file]    one raw request; "HTTP <code>" on stderr, body on stdout
 #
@@ -239,8 +242,213 @@ recent() {
     "\(.donationDate[0:16]|sub("T";" "))  $\(.amount/100)  \(.status)  \(.firstName) \(.lastName)  \(.actionPageName)\(if .actionPagesCommitmentId then "  recurring" else "" end)"'
 }
 
+event_id_valid() { [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
+
+timezone_labels() { # ZONE -> January/July abbreviations and UTC offsets in seconds
+  local zone="$1" jan jul
+  read -r jan jul < <(jq -nr 'now | gmtime | .[0] as $year |
+    [[$year,0,1,0,0,0,0,0], [$year,6,1,0,0,0,0,0]] | map(mktime|tostring) | join(" ")')
+  { TZ="$zone" date -d "@$jan" '+%Z %z'; TZ="$zone" date -d "@$jul" '+%Z %z'; } |
+    jq -Rsc 'split("\n") | map(select(.!="") | split(" ") | {name:.[0], offset:(.[1] |
+      ((.[1:3]|tonumber)*3600 + (.[3:5]|tonumber)*60) * (if startswith("-") then -1 else 1 end))})'
+}
+
+# jq 1.7 can report incorrect %Z/%z; match GNU date labels to the actual local offset.
+# shellcheck disable=SC2016 # These variables are expanded by jq.
+JQ_ZONED_TIME='
+  def zoned_time:
+    . as $epoch | ((localtime|mktime) - $epoch) as $offset |
+    ($labels | map(select(.offset==$offset)) | .[0].name) as $name |
+    strflocaltime("%Y-%m-%d %H:%M") + " " + ($name //
+      ((if $offset<0 then "-" else "+" end) + ($offset|fabs|gmtime|strftime("%H:%M"))));
+'
+
+event_catalog() { # ACCT SLUG -> merged event array with pages (including public URLs)
+  local acct="$1" slug="$2" eid
+  all "/org/v3/events?account_id=$acct&per_page=100" > "$tmp/events.json"
+  all "/org/v3/action_pages?account_id=$acct&per_page=100" > "$tmp/event-pages.json"
+  if [ "$(jq length "$tmp/events.json")" -eq 0 ]; then
+    jq -r '[.[] | select(.pageType=="event") | .eventId // empty] | unique[]' "$tmp/event-pages.json" > "$tmp/event-ids"
+    : > "$tmp/event-details.jsonl"
+    while IFS= read -r eid; do
+      event_id_valid "$eid" || die "invalid event id on an event page: $eid"
+      call GET "/org/v3/events/$eid?account_id=$acct" | jq -c '.' >> "$tmp/event-details.jsonl"
+    done < "$tmp/event-ids"
+    jq -s '.' "$tmp/event-details.jsonl" > "$tmp/events.json"
+  fi
+  jq --slurpfile pages "$tmp/event-pages.json" --arg public "${PUBLIC%/}" --arg slug "$slug" '
+    map(. as $event | . + {pages: [$pages[0][] |
+      select(((.id as $id | ($event.actionPageIds // []) | index($id)) != null)
+        or (.pageType=="event" and .eventId==$event.id)) |
+      {id, slug, name, pageType, status,
+        url: ($public + "/" + ($slug|@uri) + "/" + (.slug|@uri))}]})' "$tmp/events.json"
+}
+
+events() {
+  local acc acct slug zone row
+  local -A labels=()
+  acc="$(account "$(opt account "" "$@")")"; acct="$(jq -r .id <<<"$acc")"; slug="$(jq -r .slug <<<"$acc")"
+  [[ "$acct" =~ ^a[0-9a-f]{10}$ ]] || die "invalid account id: $acct"
+  event_catalog "$acct" "$slug" > "$tmp/catalog.json"
+  if flag json "$@"; then cat "$tmp/catalog.json"; return; fi
+  while IFS=$'\t' read -r zone row; do
+    if [ -z "${labels[$zone]+set}" ]; then labels[$zone]="$(timezone_labels "$zone")"; fi
+    TZ="$zone" jq -r --argjson labels "${labels[$zone]}" "$JQ_ZONED_TIME"'
+      def event_time: if .==null or .=="" then "" else
+        sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | zoned_time end;
+      def dollars: "\(./100|floor).\(.%100|tostring|if length<2 then "0"+. else . end)";
+      [.id, .name, (.startsAt|event_time), (.endsAt|event_time), (.ticketsSold // 0),
+        ("$"+(.totalRaised // 0|dollars)), (.pages|map(.url)|join(", "))] | @tsv' <<<"$row"
+  done < <(jq -r '.[] | (.timeZone // "UTC") + "\t" + tojson' "$tmp/catalog.json")
+}
+
+resolve_event() { # ACCT QUERY -> one event from the catalog, or a verified detail GET
+  local acct="$1" query="$2" query_id count eid detail
+  # Resolve page slugs/names from their eventId even if that event is absent from the list.
+  jq --slurpfile pages "$tmp/event-pages.json" '
+    [$pages[0][] | select(.pageType=="event" and .eventId!=null and .eventId!="")] as $pages |
+    map(. as $event | .pages=[$pages[] | select(.eventId==$event.id)]) as $events |
+    $events + ($pages | group_by(.eventId) | map(.[0] as $page |
+      select(all($events[]; .id!=$page.eventId)) |
+      {id:$page.eventId, name:$page.name, pages:., needsDetail:true}))' "$tmp/catalog.json" > "$tmp/resolvable-events.json"
+  query_id="${query,,}"
+  if event_id_valid "$query_id"; then
+    query="$query_id"
+    jq --arg id "$query" '[.[] | select(.id==$id)]' "$tmp/resolvable-events.json" > "$tmp/event-matches.json"
+    if [ "$(jq length "$tmp/event-matches.json")" -eq 0 ]; then
+      if request GET "/org/v3/events/$query?account_id=$acct" > "$tmp/event-detail.json" 2>"$tmp/event-error"; then
+        jq -e --arg id "$query" '.id==$id' "$tmp/event-detail.json" >/dev/null || die "event detail did not return requested id $query"
+        jq '[.]' "$tmp/event-detail.json" > "$tmp/event-matches.json"
+      else
+        cat "$tmp/event-error" >&2
+      fi
+    fi
+  else
+    jq --arg q "$query" '[.[] | select(any(.pages[]; .pageType=="event" and .slug==$q))] | unique_by(.id)' \
+      "$tmp/resolvable-events.json" > "$tmp/event-matches.json"
+    if [ "$(jq length "$tmp/event-matches.json")" -eq 0 ]; then
+      jq --arg q "$query" '($q|ascii_downcase) as $q | [.[] |
+        select(((.name // "" | ascii_downcase) | contains($q)) or
+          any(.pages[]; .pageType=="event" and ((.name // "" | ascii_downcase) | contains($q))))] | unique_by(.id)' \
+        "$tmp/resolvable-events.json" > "$tmp/event-matches.json"
+    fi
+  fi
+  count="$(jq length "$tmp/event-matches.json")"
+  if [ "$count" -ne 1 ]; then
+    if [ "$count" -eq 0 ]; then
+      echo "Available events (id, name, page slug):" >&2
+      jq -r '.[] | [.id, .name, ((.pages // [])|map(select(.pageType=="event")|.slug)|join(", "))] | @tsv' "$tmp/resolvable-events.json" >&2
+      die "no event matches '$query'; use an event id, exact event-page slug, or name match"
+    fi
+    echo "Matching events (id, name, page slug):" >&2
+    jq -r '.[] | [.id, .name, (.pages|map(select(.pageType=="event")|.slug)|join(", "))] | @tsv' "$tmp/event-matches.json" >&2
+    die "multiple events match '$query'; use one event id or an exact event-page slug"
+  fi
+  eid="$(jq -r '.[0].id // empty' "$tmp/event-matches.json")"
+  event_id_valid "$eid" || die "matched event has an invalid UUID: $eid"
+  if jq -e '.[0].needsDetail==true' "$tmp/event-matches.json" >/dev/null; then
+    detail="$(call GET "/org/v3/events/$eid?account_id=$acct")" || return 1
+    jq -e --arg id "$eid" '.id==$id' <<<"$detail" >/dev/null || die "event detail did not return requested id $eid"
+    jq --slurpfile matches "$tmp/event-matches.json" '. + {pages:$matches[0][0].pages}' <<<"$detail"
+    return
+  fi
+  jq '.[0]' "$tmp/event-matches.json"
+}
+
+event_tickets() { # ACCT EVENT_ID PER_PAGE EVENT_JSON -> verified tickets; never read account-wide tickets
+  local acct="$1" eid="$2" per_page="$3" event="$4" path page=1 body next total expected n got
+  event_id_valid "$eid" || die "RSVPS needs a non-empty, validated event UUID before fetching tickets"
+  [[ "$per_page" =~ ^[1-9][0-9]*$ ]] || die "ANEDOT_PER_PAGE must be a positive integer"
+  path="/org/v3/event_tickets?account_id=$acct&event_id=$eid&per_page=$per_page"
+  body="$(call GET "$path&page=1")"
+  expected="$(jq -r '.meta.totalCount // empty' <<<"$body")"
+  [ -n "$expected" ] || echo "anedot.sh: warning: ticket meta.totalCount absent; cannot verify ticket count" >&2
+  while :; do
+    jq -c '.data // []' <<<"$body" > "$tmp/ticket-page-$(printf '%06d' "$page").json"
+    next="$(jq -r '.meta.nextPage // empty' <<<"$body")"
+    total="$(jq -r '.meta.totalPages // empty' <<<"$body")"
+    n="$(jq '(.data // []) | length' <<<"$body")"
+    if [ -n "$next" ] && [ "$n" -gt 0 ]; then page="$next"
+    elif [ -n "$total" ] && [ "$page" -lt "$total" ]; then page=$((page+1))
+    else break; fi
+    body="$(call GET "$path&page=$page")"
+  done
+  jq -s 'add // []' "$tmp"/ticket-page-*.json > "$tmp/tickets-combined.json"
+  jq -e --arg id "$eid" --argjson event "$event" '
+    any(.[]; .ticketType.eventId!=null and .ticketType.eventId!=$id) or
+    (all(.[]; .ticketType.eventId==null) and
+      any(.[]; .ticketType.id as $type | ($event.ticketTypes // [] | map(.id) | index($type))==null)) |
+    not' "$tmp/tickets-combined.json" >/dev/null || die "returned tickets do not belong to the resolved event"
+  jq 'unique_by(.id)' "$tmp/tickets-combined.json" > "$tmp/tickets-unique.json"
+  got="$(jq length "$tmp/tickets-unique.json")"
+  if [ -n "$expected" ] && [ "$got" -ne "$expected" ]; then
+    die "ticket count changed during fetch (got $got of $expected); rerun"
+  fi
+  cat "$tmp/tickets-unique.json"
+  rm -f "$tmp"/ticket-page-*.json
+}
+
+rsvps() {
+  local query fields zone per_page include=false csv=false acc acct event eid arg pending="" summary
+  for arg in "$@"; do
+    if [ -n "$pending" ]; then
+      if [ -z "$arg" ] || [[ "$arg" == --* ]]; then die "$pending needs a non-empty value"; fi
+      pending=""
+    fi
+    case "$arg" in --event|--tz) pending="$arg" ;; esac
+  done
+  [ -z "$pending" ] || die "$pending needs a non-empty value"
+  query="$(opt event "" "$@")"; [ -n "$query" ] || die "RSVPS needs --event ID|SLUG|NAME"
+  fields="$(opt fields "" "$@")"; zone="$(opt tz America/New_York "$@")"; per_page="${ANEDOT_PER_PAGE:-100}"
+  if ! [[ "$zone" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || [ ! -f "/usr/share/zoneinfo/$zone" ]; then
+    die "unknown time zone: $zone"
+  fi
+  jq -en --arg f "$fields" '$f=="" or ($f|split(",")|all(.=="email" or .=="phone"))' >/dev/null || die "--fields accepts only email,phone"
+  [[ "$per_page" =~ ^[1-9][0-9]*$ ]] || die "ANEDOT_PER_PAGE must be a positive integer"
+  flag include-cancelled "$@" && include=true
+  flag csv "$@" && csv=true
+  acc="$(account "$(opt account "" "$@")")"; acct="$(jq -r .id <<<"$acc")"
+  [[ "$acct" =~ ^a[0-9a-f]{10}$ ]] || die "invalid account id: $acct"
+  event_catalog "$acct" "$(jq -r .slug <<<"$acc")" > "$tmp/catalog.json"
+  event="$(resolve_event "$acct" "$query")"; eid="$(jq -r '.id // empty' <<<"$event")"
+  event_tickets "$acct" "$eid" "$per_page" "$event" > "$tmp/tickets.json"
+  # Separate registration keys prevent a null submission from merging with another ticket.
+  jq --argjson include "$include" '
+    def registration: if .submissionId==null then ["ticket",.id] else ["submission",.submissionId] end;
+    def instant: rtrimstr("Z") | split(".") |
+      (.[0]+"Z"|fromdateiso8601) + (if length>1 then ("0."+.[1]|tonumber) else 0 end);
+    [.[] | select($include or .cancelled!=true)] as $shown |
+    {tickets: ($shown|length), registrations: ($shown|map(registration)|unique|length),
+      cancelled: (map(select(.cancelled==true))|length), refunded: (map(select(.refunded==true))|length),
+      checkedIn: ($shown|map(select(.checkedInAt!=null))|length),
+      rows: ($shown | group_by(registration) | map(.[0] as $first | (min_by(.createdAt|instant)|.createdAt) as $time |
+        group_by(.ticketType.id // .ticketType.name) | map({
+          name: ([$first.firstName // "", $first.lastName // ""]|join(" ")|ltrimstr(" ")|rtrimstr(" ")),
+          type: (.[0].ticketType.name // ""), quantity: length, cents: (map(.price // 0)|add // 0), time: $time, sortTime: ($time|instant),
+          email: ($first.email // ""), phone: ($first.phone // ""),
+          status: ([{label:"cancelled", n:(map(select(.cancelled==true))|length)},
+            {label:"refunded", n:(map(select(.refunded==true))|length)},
+            {label:"checked-in", n:(map(select(.checkedInAt!=null))|length)}] |
+            map(select(.n>0)|"\(.n) \(.label)")|join(", "))})) | add // [] | sort_by(.sortTime))}' \
+    "$tmp/tickets.json" > "$tmp/registrations.json"
+  TZ="$zone" jq -r --arg f "$fields" --argjson csv "$csv" \
+    --argjson labels "$(timezone_labels "$zone")" "$JQ_ZONED_TIME"'
+    def cell: if $csv and test("^[=+@\\t\\r-]") then "\u0027"+. else . end;
+    def dollars: "\(./100|floor).\(.%100|tostring|if length<2 then "0"+. else . end)";
+    (if $f=="" then [] else $f|split(",")|unique end) as $fields |
+    (["Name", "Ticket type", "Quantity", "Amount ($)", "RSVP time"] +
+      ($fields|map(if .=="email" then "Email" else "Phone" end)) + ["Status"]),
+    (.rows[] | . as $row | [(.name|cell), (.type|cell), (.quantity|tostring), (.cents|dollars),
+      (.sortTime|floor|zoned_time)] +
+      ($fields|map($row[.]|cell)) + [(.status|cell)]) |
+    if $csv then @csv else @tsv end' "$tmp/registrations.json"
+  summary="$(jq -r --arg name "$(jq -r .name <<<"$event")" '
+    "\($name): \(.tickets) tickets shown, \(.registrations) registrations shown, \(.checkedIn) checked in among shown tickets; across all fetched tickets: \(.cancelled) cancelled, \(.refunded) refunded"' "$tmp/registrations.json")"
+  if $csv; then printf '%s\n' "$summary" >&2; else printf '%s\n' "$summary"; fi
+}
+
 case "${1:-}" in
-  ALL|ACCOUNTS|CREATE_PAGE|STATS|RECENT|PAUSE|ACTIVATE)
+  ALL|ACCOUNTS|CREATE_PAGE|STATS|RECENT|PAUSE|ACTIVATE|EVENTS|RSVPS)
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
     CMD="$1"; shift
     case "$CMD" in
@@ -250,8 +458,10 @@ case "${1:-}" in
       CREATE_PAGE) create_page "$@" ;;
       STATS) stats "$@" ;;
       RECENT) recent "$@" ;;
+      EVENTS) events "$@" ;;
+      RSVPS) rsvps "$@" ;;
       PAUSE|ACTIVATE) set_state "$@" ;;
     esac ;;
-  ""|-h|--help) sed -n '2,20p' "$0" >&2; exit 2 ;;
+  ""|-h|--help) sed -n '2,/^set -euo pipefail/{ /^#/p; }' "$0" >&2; exit 2 ;;
   *) request "$@" ;;
 esac

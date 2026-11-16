@@ -1,6 +1,6 @@
 ---
 name: Anedot
-description: When the user asks, by voice or text, to create or change an Anedot donation page, look up donations, get account stats, or run donor reports such as lapsed donors.
+description: When the user asks, by voice or text, to create or change an Anedot donation page, look up donations, events or RSVPs, get account stats, or run donor reports such as lapsed donors.
 ---
 # Anedot
 
@@ -14,6 +14,8 @@ All calls go through `scripts/anedot.sh` (run it with no arguments for usage). T
 | "Which accounts do I have?" | `scripts/anedot.sh ACCOUNTS` |
 | "How did we do last month?" | `scripts/anedot.sh STATS --account <slug> --from YYYY-MM-DD --to YYYY-MM-DD` |
 | "Any recent gifts?" | `scripts/anedot.sh RECENT --account <slug> 10` |
+| "What events do we have?" | `scripts/anedot.sh EVENTS --account <slug>` |
+| "Who RSVP'd to X?" | `scripts/anedot.sh RSVPS --account <slug> --event <page slug\|name\|id>` (email/phone need `--fields email,phone`) |
 | "Pause / reopen that page" | `scripts/anedot.sh PAUSE\|ACTIVATE --account <slug> --page <page id>` |
 
 `CREATE_PAGE` builds the seven configs in parallel, creates the page, activates it, checks the public page shows the form, and prints the URL and page id (about 3 seconds). It applies every default below. Options: `--slug`, `--body`, `--amounts`, `--once-only`, `--federal`, `--header-image-id`, `--logo-image-id`, `--primary`, `--button-text`, `--bg`, `--draft`.
@@ -26,6 +28,7 @@ All calls go through `scripts/anedot.sh` (run it with no arguments for usage). T
 4. **Links are always live.** Only return a page link after it is active and the public page shows the form. `CREATE_PAGE` and `ACTIVATE` enforce this. A `--draft` page gets no link.
 5. Money in dollars (the API uses cents). Times in the user's zone. Never invent numbers; on a failure, give the HTTP status.
 6. Fill gaps with defaults instead of questions.
+7. RSVP lists are per-event. Email and phone are opt-in (`--fields email,phone`); omit other private ticket fields. Cancelled tickets are excluded unless `--include-cancelled` is requested.
 
 ## Go deeper only when needed
 
