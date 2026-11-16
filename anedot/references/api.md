@@ -26,6 +26,8 @@ export ANEDOT_TOKEN_CMD='<command that prints your PAT>'   # or export ANEDOT_TO
 scripts/anedot.sh GET  "/user/v3/me"                 # token check
 scripts/anedot.sh ACCOUNTS                         # one line per account: slug, displayName, id, status, type, zone
 scripts/anedot.sh CREATE_PAGE --account my-org      # live page in ~3s; prints URL and id
+scripts/anedot.sh EVENTS --account my-org           # all events, local times, dollar totals, page URLs; --json for merged records
+scripts/anedot.sh RSVPS --account my-org --event dinner  # per-event registrations; contact fields opt-in via --fields email,phone
 scripts/anedot.sh POST "/org/v3/action_pages?account_id=$ACCT" page.json
 scripts/anedot.sh ALL  "/org/v3/donations?account_id=$ACCT&per_page=500&start_date=2026-01-01"
 ```
@@ -33,6 +35,8 @@ scripts/anedot.sh ALL  "/org/v3/donations?account_id=$ACCT&per_page=500&start_da
 `METHOD PATH [json-file]` prints the body to stdout and `HTTP <code>` to stderr. It exits non-zero on a non-2xx status. `ALL PATH` walks every page and prints one JSON array of records. If any page fails, `ALL` prints the failing path, status, and body to stderr and exits non-zero; it never returns a partial list. `ACCOUNTS` prints tab-separated lines (`--json` for `[{id, displayName, slug, status, category, subCategory, timeZone}]`) and caches them in `~/.cache/anedot-skill/accounts.json` for slug lookups. It leaves out the legal name (`name`) on purpose: identify, show, and match accounts by `displayName` and `slug` only.
 
 When you capture the body of a single call, keep stderr out of it (`2>/dev/null` or `2>code.txt`) so the `HTTP <code>` line does not break JSON parsing.
+
+`EVENTS` joins events to action pages for public URLs and falls back to event-page discovery if the events list is empty. `RSVPS` resolves an event id, exact event-page slug, or case-insensitive name match to exactly one event before reading tickets. It groups tickets by registration and ticket type, displays dollars and local RSVP times (`--tz`, default `America/New_York`), and excludes cancelled tickets unless `--include-cancelled` is set. `--tz` must name an installed zone under `/usr/share/zoneinfo`; empty `--event` and `--tz` values are rejected. Time formatting requires jq 1.7 with `strflocaltime` honoring `TZ`. `--csv` quotes every field, prefixes a single quote to API text cells starting with `=`, `+`, `-`, `@`, tab, or CR, and sends the summary to stderr. Amounts stay numeric in form, and TSV text is unchanged. Summary ticket/registration/checked-in counts describe the displayed tickets; cancelled/refunded counts cover all fetched tickets. `ANEDOT_PER_PAGE` overrides the ticket page size (positive integer, default 100).
 
 The core of it, if you need to inline the call:
 
@@ -81,6 +85,36 @@ Record fields seen: `id`, `amount` and `netAmount` and `originalAmount` and `ref
 
 There is no `fees` field. Fees are `anedotFeeAmount` plus `vendorFeeAmount`; on completed gifts `amount - netAmount` equals that sum. The donation record carries no frequency field. A gift with a non-null `actionPagesCommitmentId` is part of a recurring commitment; look up the commitment for its schedule.
 
+### Events and tickets
+
+Verified in production on 2026-11-16:
+
+| Call | Notes |
+|---|---|
+| `GET /org/v3/events?account_id={id}&per_page=100` | `{data:[...], meta:{currentPage,totalPages,totalCount}}`; paginate all pages. |
+| `GET /org/v3/events/{event_id}?account_id={id}` | The event object itself, with no `data` wrapper. |
+| `GET /org/v3/action_pages?account_id={id}&per_page=100` | Paginated pages with `id`, `slug`, `name`, `pageType` (`donation`, `lead`, `event`), `eventId` (on event pages), and `status`. |
+| `GET /org/v3/event_tickets?account_id={id}&event_id={event_id}&per_page=N&page=P` | `{data, meta:{currentPage,totalPages,totalCount}}`. `per_page` is honored: 9 tickets at `per_page=4` gave 3 pages. |
+
+Events have `id`, `name`, `startsAt`, `endsAt` (UTC `Z`), `timeZone` (for example `America/New_York`), `allDay`, `ticketsSold`, `totalRaised` (cents), `actionPageIds` (page id array), `ticketTypes`, `capacity`, `eventType`, `locationType`, `webLink` (often null), `createdAt`, `updatedAt`, and `description`. There is **no `url` field**. Match pages by `actionPageIds` or by `pageType=="event"` and `eventId==event.id`. Build public URLs as `$PUBLIC/{account slug}/{page slug}` (`$PUBLIC` defaults to `https://secure.anedot.com`). Display event times in the event's `timeZone`, falling back to UTC when null.
+
+**Require a validated, non-empty `event_id` for every ticket call.** Without it, `/org/v3/event_tickets` returns every ticket on the account. `action_page_id` and `action_page_ids` are silently ignored, so they cannot scope an RSVP list. The helper lowercases UUID input, requires event ids to match `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, and resolves exactly one event before fetching tickets. Tickets are de-duplicated by `id` and checked against the first page's `meta.totalCount`; a mismatch fails with a rerun message, while an absent count warns on stderr. Any present `ticketType.eventId` must match the resolved event. If all tickets lack it, every `ticketType.id` must belong to the event's `ticketTypes`.
+
+Each ticket record is **one ticket**, with no quantity field. Keys: `id`, `firstName`, `lastName`, `email`, `phone`, `address`, `employerName`, `occupation`, `currentlyEmployed`, `price` (cents), `status` (seen `active`), `cancelled` (boolean), `refunded` (boolean), `checkedInAt` (null or UTC `Z`), `createdAt` (UTC `Z`), `submissionId`, `ticketType` (`id`, `eventId`, `name`, `price` in cents, ...), `ticketGroup`, `pdf`, `qrCode`, and `promoCodeBreakdown`. Group by `submissionId` for registrations; a null submission id is its own registration keyed by ticket id. Split each registration into ticket-type rows and count records for quantity. Use the earliest registration `createdAt` for RSVP time. Exclude only `cancelled==true` by default; flag refunds and check-ins without filtering them out. Email/phone require `--fields`; do not output address, employer, occupation, QR codes, or PDFs.
+
+Prices are **verified cents**: three tickets at `price:100` in one submission matched one donation at `amount:300` with the same `submissionId`, and event `totalRaised` was `300`. Divide by 100 for dollar output.
+
+These endpoints return **404**; skip them:
+
+- `/org/v3/tickets`
+- `/org/v3/attendees`
+- `/org/v3/registrations`
+- `/org/v3/event_attendees`
+- `/org/v3/event_registrations`
+- `/org/v3/events/{id}/tickets`
+- `/org/v3/events/{id}/attendees`
+- `/org/v3/action_pages/{id}/tickets`
+
 ### Other reads
 
 | Call | Notes |
@@ -109,12 +143,12 @@ There is no `fees` field. Fees are `anedotFeeAmount` plus `vendorFeeAmount`; on 
 Page facts:
 
 - There is no draft status. A draft is a page created with a pause window (`pauseStartAt` now, `pauseEndAt` far in the future, plus `pausedMessage`). It reads back as `status: "paused"`. After `activate` it read back as `status: "active"` with both pause fields null. Persisted statuses per the API implementation are `active`, `archived`, and `deleted`; `paused` is derived from the window.
-- Public URL: `https://secure.anedot.com/{account slug}/{page slug}`. Fetch it with a browser-like `User-Agent`; curl's default agent gets `403`. A paused page still returns 200, so check the HTML for `<form`, not only the status. Only share a link once the page is active and the form shows.
+- Public URL: `https://secure.anedot.com/{account slug}/{page slug}`. Fetch it with a browser-like `User-Agent`; curl's default agent gets `403`. A paused page still returns 200, so check the HTML for `<form`, not only the status. Only share a link once the page is active and the form shows (a requested draft's link may be shared with a note that it is paused).
 - A page created with a pause window reads back with `pauseStartAt` and `pauseEndAt` in the account's time zone.
 - Live check: the HTML of a live page contains `<form`; a paused page has none. The `pausedMessage` text is embedded in both, so do not test for it. `pausedMessage` and `backgroundImagePosition` are required on create.
 
 ### Images
 
-- `POST /org/v3/account_images` answers `403 {"error":"Personal access tokens cannot call this endpoint"}`. `GET /org/v3/account_images` works and lists uploaded images (`id`, `file.url`).
+- `POST /org/v3/account_images?account_id=ID` with multipart field `file` uploads an image with a PAT (verified 2026-10-28; answers 202 with `id`, `file.url`). `GET /org/v3/account_images` lists uploaded images (`id`, `file.url`).
 - The checkout renders `headerImageId` (page) and `logoImageId` (design config) from uploaded images. Setting `headerImageId` by page PATCH is verified; `logoImageId` uses the same design-config PATCH (not yet verified). `headerImageUrl` is accepted but not rendered.
-- A new image needs a one-time dashboard upload; then set its id.
+- Upload a new image with `anedot.sh UPLOAD_IMAGE`, then set its id.
