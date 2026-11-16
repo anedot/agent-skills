@@ -1,5 +1,7 @@
 # Anedot bot skills
 
+> **Closed beta:** The Anedot skill (Anedot for Agents) is in closed beta. For early access, follow [@pauldietzel](https://x.com/pauldietzel) and [@anedot](https://x.com/anedot) on X, then DM [@pauldietzel](https://x.com/pauldietzel).
+
 Open-source skills that let an AI assistant run your [Anedot](https://anedot.com) account from plain requests, spoken or typed:
 
 - "Make me a donation page for the fall drive, $25 to $250, monthly too." → a live page link
