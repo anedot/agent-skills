@@ -238,8 +238,26 @@ stats() {
     "other: \(map(select(.status!="completed"))|group_by(.status)|map("\(.[0].status) \(length)")|join(", ") | if .=="" then "none" else . end)"'
 }
 
+idempotency_key() { # random UUID; keys are global across accounts and tokens
+  local key hex source="${ANEDOT_UUID_SOURCE:-/proc/sys/kernel/random/uuid}"
+  local uuid='^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  if [ -r "$source" ] && IFS= read -r key < "$source" && [[ "$key" =~ $uuid ]]; then
+    printf '%s\n' "$key"; return
+  fi
+  if command -v uuidgen >/dev/null && key="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]')" && [[ "$key" =~ $uuid ]]; then
+    printf '%s\n' "$key"; return
+  fi
+  hex="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || die "could not generate upload key"
+  [[ "$hex" =~ ^[0-9a-f]{32}$ ]] || die "could not generate upload key"
+  key="$(printf '%s-%s-4%s-%x%s-%s\n' "${hex:0:8}" "${hex:8:4}" "${hex:13:3}" \
+    "$(( (16#${hex:16:1} & 3) | 8 ))" "${hex:17:3}" "${hex:20:12}")"
+  [[ "$key" =~ $uuid ]] || die "could not generate upload key"
+  printf '%s\n' "$key"
+}
+
 upload_image() { # --account A --file PATH|URL -> prints the new image id and its URL
-  local acct src u ext f code tok out n401=0 nbusy=0
+  local acct src u ext f code tok out headers key delay n401=0 nbusy=0 n409=0 ambiguous=0
+  local hint='the image may have been created; check GET /org/v3/account_images before re-running'
   acct="$(account "$(opt account "" "$@")" | jq -r .id)"; src="$(opt file "" "$@")"
   [ -n "$src" ] || die "UPLOAD_IMAGE needs --file PATH or URL (png, jpg, gif, webp)"
   u="$src"; [[ "$src" =~ ^https?:// ]] && u="${src%%[?#]*}"
@@ -255,19 +273,34 @@ upload_image() { # --account A --file PATH|URL -> prints the new image id and it
   fi
   [ -s "$f" ] || die "empty or missing file: $src"
   tok="${TOK:-$(token)}"; [ -n "$tok" ] || die "token is empty"
-  out="$tmp/upload.json"
-  local args=(-s -o "$out" -w '%{http_code}' -X POST "$BASE/org/v3/account_images?account_id=$acct"
+  out="$tmp/upload.json"; headers="$tmp/upload.headers"; key="$(idempotency_key)"
+  # Default busy retries: 4 attempts at 60s + 12s of sleeps fit inside the 5-minute key TTL.
+  local args=(-s --max-time 60 -o "$out" -D "$headers" -w '%{http_code}' -X POST "$BASE/org/v3/account_images?account_id=$acct"
     -H "Authorization: Bearer $tok" -H "User-Agent: $UA" -H "Accept: application/json" -F "file=@$f")
   while :; do
-    : > "$out"
-    code="$(curl "${args[@]}" || true)"; code="${code:-000}"
+    : > "$out"; : > "$headers"
+    code="$(curl "${args[@]}" -H "Idempotency-Key: $key")" || code=000
+    code="${code:-000}"
     case "$code" in
-      401) [ "$n401" -lt "$RETRIES_401" ] || break; n401=$((n401+1)); sleep 1 ;;
-      429|5??|000) [ "$nbusy" -lt "$RETRIES_BUSY" ] || break; nbusy=$((nbusy+1)); sleep $((nbusy*2)) ;;
+      # Some auth/rate-limit errors precede idempotency; never rotate after an ambiguous outcome.
+      401) [ "$n401" -lt "$RETRIES_401" ] || break; n401=$((n401+1)); sleep 1; if [ "$ambiguous" = 0 ]; then key="$(idempotency_key)"; fi ;;
+      429) [ "$nbusy" -lt "$RETRIES_BUSY" ] || break; nbusy=$((nbusy+1)); sleep $((nbusy*2)); if [ "$ambiguous" = 0 ]; then key="$(idempotency_key)"; fi ;;
+      5??|000) ambiguous=1; [ "$nbusy" -lt "$RETRIES_BUSY" ] || break; nbusy=$((nbusy+1)); sleep $((nbusy*2)) ;;
+      409)
+        ambiguous=1
+        [ "$n409" -lt 10 ] || die "upload still in progress after 10 retries (Idempotency-Key: $key); $hint"
+        n409=$((n409+1))
+        delay="$(awk 'tolower($1)=="retry-after:" {gsub("\r", "", $2); value=$2} END {print value}' "$headers" || true)"
+        [[ "$delay" =~ ^([1-9]|10)$ ]] || delay=1
+        sleep "$delay" ;;
       *) break ;;
     esac
   done
-  [[ "$code" =~ ^2 ]] || { echo "HTTP $code" >&2; cat "$out" >&2; exit 1; }
+  if [[ ! "$code" =~ ^2 ]]; then
+    echo "HTTP $code (Idempotency-Key: $key)" >&2; cat "$out" >&2
+    case "$code" in 5??|000|409) echo "$hint" >&2 ;; esac
+    exit 1
+  fi
   jq -er 'select(.id)|"\(.id)\t\(.file.url)"' "$out" || die "upload answered $code without an id"
 }
 
