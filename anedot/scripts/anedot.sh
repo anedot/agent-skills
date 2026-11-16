@@ -6,6 +6,7 @@
 #   anedot.sh ACCOUNTS [--json]          accounts: slug, displayName, id, status, org type, time zone
 #   anedot.sh STATS --account A --from YYYY-MM-DD --to YYYY-MM-DD    one-line totals in dollars
 #   anedot.sh RECENT --account A [N]     last N donations (default 5), one line each
+#   anedot.sh UPLOAD_IMAGE --account A --file PATH|URL   upload an image; prints id and URL (use with --header-image-id/--logo-image-id)
 #   anedot.sh EVENTS --account SLUG|ID [--json]    events, local times, totals, and page URLs
 #   anedot.sh RSVPS --account SLUG|ID --event ID|SLUG|NAME [--fields email,phone]
 #     [--include-cancelled] [--csv] [--tz ZONE]    per-event registrations (default zone America/New_York)
@@ -14,8 +15,10 @@
 #
 # CREATE_PAGE options: --slug S, --body HTML, --amounts 25,50,100,250,500,1000 (dollars),
 #   --once-only, --federal (employer+occupation required; auto-on for federal accounts),
-#   --header-image-id ID / --logo-image-id ID (ids from GET /org/v3/account_images),
-#   --primary HEX --button-text HEX --bg HEX (colors), --draft (paused, no link).
+#   --header-image-id ID / --logo-image-id ID (ids from GET /org/v3/account_images or UPLOAD_IMAGE),
+#   --primary HEX --button-text HEX --bg HEX (colors),
+#   --draft (prints the URL, which shows the paused message until ACTIVATE),
+#   --show-title (keep title text over a header image).
 #
 # Token: ANEDOT_TOKEN, or ANEDOT_TOKEN_CMD (a command that prints it). Never echoed.
 # Exits non-zero on any non-2xx status, printing the status and error body to stderr.
@@ -179,7 +182,7 @@ create_page() {
   # Phase 2: page. pausedMessage and backgroundImagePosition are required even for a live page.
   now="$(date -u +%FT%TZ)"
   jq -n --arg t "$title" --arg s "$pslug" --arg body "$body" --arg hid "$(opt header-image-id "" "$@")" \
-    --argjson draft "$draft" --arg now "$now" \
+    --argjson draft "$draft" --arg now "$now" --argjson showtitle "$(flag show-title "$@" && echo true || echo false)" \
     --arg a "$(cat "$tmp/amount.id")" --arg c "$(cat "$tmp/confirmation.id")" --arg d "$(cat "$tmp/design.id")" \
     --arg f "$(cat "$tmp/field.id")" --arg fu "$(cat "$tmp/fund.id")" --arg g "$(cat "$tmp/general.id")" --arg p "$(cat "$tmp/payment.id")" \
     '{type:"DonationActionPage",name:$t,slug:$s,headerTitleText:$t,headerTitleAlignment:"center",formAlignment:"center",
@@ -190,6 +193,7 @@ create_page() {
     amountConfigurationId:$a,confirmationConfigurationId:$c,designConfigurationId:$d,fieldConfigurationId:$f,
     fundConfigurationId:$fu,generalConfigurationId:$g,paymentConfigurationId:$p}
     + (if $hid != "" then {headerImageId:$hid} else {} end)
+    + (if $hid != "" and ($showtitle|not) then {headerTitleText:null} else {} end)
     + (if $draft then {pauseStartAt:$now,pauseEndAt:"2099-12-31T00:00:00Z"} else {} end)' > "$tmp/page.json"
   local page id
   if ! page="$(request POST "/org/v3/action_pages?account_id=$acct" "$tmp/page.json" 2>/dev/null)"; then
@@ -198,13 +202,13 @@ create_page() {
     page="$(call POST "/org/v3/action_pages?account_id=$acct" "$tmp/page2.json")"
   fi
   id="$(jq -r .id <<<"$page")"; pslug="$(jq -r .slug <<<"$page")"
+  local url="$PUBLIC/$slug/$pslug"
   if $draft; then
-    printf 'draft %s (paused, no public link until activated) %.1fs\n' "$id" "$(elapsed "$t0")"; return
+    printf '%s\ndraft %s (paused: shows the paused message until ACTIVATE --account %s --page %s) %.1fs\n' "$url" "$id" "$acct" "$id" "$(elapsed "$t0")"; return
   fi
 
   # Phase 3: activate, then verify the public page shows the form (a paused page has no <form>).
   call PATCH "/org/v3/action_pages/$id/activate?account_id=$acct" >/dev/null
-  local url="$PUBLIC/$slug/$pslug"
   verify_live "$url" || die "page $id was activated but $url does not show the form yet"
   printf '%s\nid %s  %.1fs\n' "$url" "$id" "$(elapsed "$t0")"
 }
@@ -232,6 +236,39 @@ stats() {
     (map(select(.status=="completed"))) as $c |
     "\($w): \($c|length) completed, gross $\(($c|map(.amount)|add // 0)/100), fees $\(($c|map((.anedotFeeAmount//0)+(.vendorFeeAmount//0))|add // 0)/100), net $\(($c|map(.netAmount)|add // 0)/100), recurring \($c|map(select(.actionPagesCommitmentId!=null))|length), donors \($c|map(.email|ascii_downcase? // "")|unique|length)" ,
     "other: \(map(select(.status!="completed"))|group_by(.status)|map("\(.[0].status) \(length)")|join(", ") | if .=="" then "none" else . end)"'
+}
+
+upload_image() { # --account A --file PATH|URL -> prints the new image id and its URL
+  local acct src u ext f code tok out n401=0 nbusy=0
+  acct="$(account "$(opt account "" "$@")" | jq -r .id)"; src="$(opt file "" "$@")"
+  [ -n "$src" ] || die "UPLOAD_IMAGE needs --file PATH or URL (png, jpg, gif, webp)"
+  u="$src"; [[ "$src" =~ ^https?:// ]] && u="${src%%[?#]*}"
+  ext="${u##*/}"; ext="${ext##*.}"
+  ext="$(printf %s "$ext" | tr "[:upper:]" "[:lower:]")"
+  [[ "$ext" =~ ^(png|jpe?g|gif|webp)$ ]] || ext=img
+  f="$tmp/upload.$ext"
+  if [[ "$src" =~ ^https?:// ]]; then
+    curl -sfL --proto '=http,https' --max-time 30 --max-filesize 10485760 -A "$UA" "$src" -o "$f" || die "could not download $src"
+  else
+    [ -s "$src" ] || die "empty or missing file: $src"
+    cp -- "$src" "$f"
+  fi
+  [ -s "$f" ] || die "empty or missing file: $src"
+  tok="${TOK:-$(token)}"; [ -n "$tok" ] || die "token is empty"
+  out="$tmp/upload.json"
+  local args=(-s -o "$out" -w '%{http_code}' -X POST "$BASE/org/v3/account_images?account_id=$acct"
+    -H "Authorization: Bearer $tok" -H "User-Agent: $UA" -H "Accept: application/json" -F "file=@$f")
+  while :; do
+    : > "$out"
+    code="$(curl "${args[@]}" || true)"; code="${code:-000}"
+    case "$code" in
+      401) [ "$n401" -lt "$RETRIES_401" ] || break; n401=$((n401+1)); sleep 1 ;;
+      429|5??|000) [ "$nbusy" -lt "$RETRIES_BUSY" ] || break; nbusy=$((nbusy+1)); sleep $((nbusy*2)) ;;
+      *) break ;;
+    esac
+  done
+  [[ "$code" =~ ^2 ]] || { echo "HTTP $code" >&2; cat "$out" >&2; exit 1; }
+  jq -er 'select(.id)|"\(.id)\t\(.file.url)"' "$out" || die "upload answered $code without an id"
 }
 
 recent() {
@@ -448,7 +485,7 @@ rsvps() {
 }
 
 case "${1:-}" in
-  ALL|ACCOUNTS|CREATE_PAGE|STATS|RECENT|PAUSE|ACTIVATE|EVENTS|RSVPS)
+  ALL|ACCOUNTS|CREATE_PAGE|STATS|RECENT|PAUSE|ACTIVATE|UPLOAD_IMAGE|EVENTS|RSVPS)
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
     CMD="$1"; shift
     case "$CMD" in
@@ -458,6 +495,7 @@ case "${1:-}" in
       CREATE_PAGE) create_page "$@" ;;
       STATS) stats "$@" ;;
       RECENT) recent "$@" ;;
+      UPLOAD_IMAGE) upload_image "$@" ;;
       EVENTS) events "$@" ;;
       RSVPS) rsvps "$@" ;;
       PAUSE|ACTIVATE) set_state "$@" ;;

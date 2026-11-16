@@ -56,13 +56,13 @@ Page (`POST /org/v3/action_pages`): `type: "DonationActionPage"`, `name`, `slug`
 
 - `PATCH /org/v3/action_pages/{id}/activate` returns 204.
 - Fetch `https://secure.anedot.com/{account slug}/{page slug}` with a browser `User-Agent` (curl's default gets 403). Live means the HTML contains `<form`. A paused page also returns 200 and has no form. The `pausedMessage` text is in the page data either way, so do not test for it.
-- A draft (`--draft`) has a pause window and gets no link until activated.
+- A draft (`--draft`) has a pause window; its URL is printed but shows the paused message until `ACTIVATE --account A --page ID`.
 
 ## Images
 
 - The checkout renders uploaded images by id: `headerImageId` on the page, `logoImageId` on the design config. List them with `GET /org/v3/account_images?account_id=...` (each has `id` and `file.url`).
 - `headerImageUrl` is stored but not shown by the current checkout. Do not rely on it.
-- A PAT cannot upload (`POST /org/v3/account_images` returns 403). For a new image, prepare it (header about 2400x1000, under 1 MB), host it at a public HTTPS image URL or hand the file to the user, and ask them to upload it once in the Anedot dashboard. Then set the id.
+- Upload new images yourself: `anedot.sh UPLOAD_IMAGE --account A --file PATH|URL` prints the id and URL (header about 2400x1000, under 1 MB works well). Then pass the id to `--header-image-id` or `--logo-image-id`.
 - With no `logoImageId`, the page shows the account's logo.
 
 ## Design colors

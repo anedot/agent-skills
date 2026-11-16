@@ -143,12 +143,12 @@ These endpoints return **404**; skip them:
 Page facts:
 
 - There is no draft status. A draft is a page created with a pause window (`pauseStartAt` now, `pauseEndAt` far in the future, plus `pausedMessage`). It reads back as `status: "paused"`. After `activate` it read back as `status: "active"` with both pause fields null. Persisted statuses per the API implementation are `active`, `archived`, and `deleted`; `paused` is derived from the window.
-- Public URL: `https://secure.anedot.com/{account slug}/{page slug}`. Fetch it with a browser-like `User-Agent`; curl's default agent gets `403`. A paused page still returns 200, so check the HTML for `<form`, not only the status. Only share a link once the page is active and the form shows.
+- Public URL: `https://secure.anedot.com/{account slug}/{page slug}`. Fetch it with a browser-like `User-Agent`; curl's default agent gets `403`. A paused page still returns 200, so check the HTML for `<form`, not only the status. Only share a link once the page is active and the form shows (a requested draft's link may be shared with a note that it is paused).
 - A page created with a pause window reads back with `pauseStartAt` and `pauseEndAt` in the account's time zone.
 - Live check: the HTML of a live page contains `<form`; a paused page has none. The `pausedMessage` text is embedded in both, so do not test for it. `pausedMessage` and `backgroundImagePosition` are required on create.
 
 ### Images
 
-- `POST /org/v3/account_images` answers `403 {"error":"Personal access tokens cannot call this endpoint"}`. `GET /org/v3/account_images` works and lists uploaded images (`id`, `file.url`).
+- `POST /org/v3/account_images?account_id=ID` with multipart field `file` uploads an image with a PAT (verified 2026-10-28; answers 202 with `id`, `file.url`). `GET /org/v3/account_images` lists uploaded images (`id`, `file.url`).
 - The checkout renders `headerImageId` (page) and `logoImageId` (design config) from uploaded images. Setting `headerImageId` by page PATCH is verified; `logoImageId` uses the same design-config PATCH (not yet verified). `headerImageUrl` is accepted but not rendered.
-- A new image needs a one-time dashboard upload; then set its id.
+- Upload a new image with `anedot.sh UPLOAD_IMAGE`, then set its id.
